@@ -1,0 +1,16 @@
+{
+  "configurations": [
+    {
+      "name": "MinGW",
+      "compilerPath": "C:/msys64/ucrt64/bin/g++",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "C:/opencv/opencv/build/include",
+        "C:/eigen"
+      ],
+      "cppStandard": "c++17",
+      "intelliSenseMode": "gcc-x64"
+    }
+  ],
+  "version": 4
+}
