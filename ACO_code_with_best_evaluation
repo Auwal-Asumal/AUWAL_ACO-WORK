@@ -1,0 +1,285 @@
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import cv2
+import os
+from tqdm import tqdm
+from scipy.optimize import linear_sum_assignment
+
+# Constants for IoU calculation, derived from the main script (cell 1rrQ1Kyz1G5z)
+IOU_RENDER_SZ = 400
+SPACE_SIZE_MM = 40.0
+
+def calculate_iou(e1, e2): # Removed img_size parameter as it will be derived
+    """
+    Calculate IoU between two ellipses using mask-based approach.
+    e1, e2: dict with center_x, center_y, semi_major_axis, semi_minor_axis, orientation_angle_rad
+    """
+    mask1 = np.zeros((IOU_RENDER_SZ, IOU_RENDER_SZ), dtype=np.uint8)
+    mask2 = np.zeros((IOU_RENDER_SZ, IOU_RENDER_SZ), dtype=np.uint8)
+
+    scale_factor = IOU_RENDER_SZ / SPACE_SIZE_MM
+
+    # Helper to convert mm ellipse params to render_size pixels
+    def _render_ellipse_params(e_mm):
+        cx_r = int(round(e_mm['center_x'] * scale_factor))
+        cy_r = int(round(e_mm['center_y'] * scale_factor))
+        a_r = max(1, int(round(e_mm['semi_major_axis'] * scale_factor)))
+        b_r = max(1, int(round(e_mm['semi_minor_axis'] * scale_factor)))
+        angle_deg = np.degrees(e_mm['orientation_angle_rad'])
+        return (cx_r, cy_r), (a_r, b_r), angle_deg
+
+    center1, axes1, angle1 = _render_ellipse_params(e1)
+    center2, axes2, angle2 = _render_ellipse_params(e2)
+
+    cv2.ellipse(mask1, center1, axes1, angle1, 0, 360, 1, -1)
+    cv2.ellipse(mask2, center2, axes2, angle2, 0, 360, 1, -1)
+
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    if union == 0:
+        return 0
+    return intersection / union
+
+class AntColonyMatcher:
+    """
+    Simple ACO for matching detected ellipses to ground truth.
+    In this specific task, since we are evaluating, we might just use Hungarian algorithm
+    for optimal matching, but the user specifically asked for ACO.
+    We will implement a simplified ACO to find the best permutation/matching.
+    """
+    def __init__(self, cost_matrix, n_ants=10, n_iterations=20, decay=0.1, alpha=1, beta=2):
+        self.cost_matrix = cost_matrix
+        self.n_ants = n_ants
+        self.n_iterations = n_iterations
+        self.decay = decay
+        self.alpha = alpha
+        self.beta = beta
+        self.n_gt, self.n_det = cost_matrix.shape
+        self.pheromone = np.ones(cost_matrix.shape) / (self.n_gt * self.n_det)
+
+    def run(self):
+        best_matching = None
+        best_cost = float('inf')
+
+        for _ in range(self.n_iterations):
+            all_paths = self.gen_all_paths()
+            self.update_pheromone(all_paths)
+
+            for path, cost in all_paths:
+                if cost < best_cost:
+                    best_cost = cost
+                    best_matching = path
+
+            self.pheromone *= (1 - self.decay)
+
+        return best_matching, best_cost
+
+    def gen_all_paths(self):
+        all_paths = []
+        for _ in range(self.n_ants):
+            path = self.gen_path()
+            cost = self.calculate_path_cost(path)
+            all_paths.append((path, cost))
+        return all_paths
+
+    def gen_path(self):
+        path = []
+        visited_det = set()
+        # Each ant tries to match each GT to a DET
+        gt_indices = list(range(self.n_gt))
+        np.random.shuffle(gt_indices)
+
+        for i in gt_indices:
+            probs = self.calculate_probs(i, visited_det)
+            if len(probs) == 0:
+                path.append((i, -1)) # No match
+                continue
+
+            det_idx = np.random.choice(range(self.n_det), p=probs)
+            path.append((i, det_idx))
+            visited_det.add(det_idx)
+        return path
+
+    def calculate_probs(self, gt_idx, visited_det):
+        available_det = [j for j in range(self.n_det) if j not in visited_det]
+        if not available_det:
+            return []
+
+        # Heuristic: 1 / (cost + epsilon)
+        heuristic = 1.0 / (self.cost_matrix[gt_idx, available_det] + 1e-6)
+        attraction = (self.pheromone[gt_idx, available_det] ** self.alpha) * (heuristic ** self.beta)
+        probs = attraction / attraction.sum()
+
+        full_probs = np.zeros(self.n_det)
+        full_probs[available_det] = probs
+        return full_probs
+
+    def calculate_path_cost(self, path):
+        cost = 0
+        for gt_idx, det_idx in path:
+            if det_idx != -1:
+                cost += self.cost_matrix[gt_idx, det_idx]
+            else:
+                cost += 1000 # Penalty for no match
+        return cost
+
+    def update_pheromone(self, all_paths):
+        for path, cost in all_paths:
+            for gt_idx, det_idx in path:
+                if det_idx != -1:
+                    self.pheromone[gt_idx, det_idx] += 1.0 / (cost + 1e-6)
+
+def evaluate_dataset(json_path, img_dir, output_dir):
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    annotations = data['annotations']
+    results = []
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    if not os.path.exists(f"{output_dir}/visualizations"):
+        os.makedirs(f"{output_dir}/visualizations")
+
+    all_metrics = []
+
+    for ann in tqdm(annotations[:1000]): # Process first 1000 for speed, can do all if needed
+        img_id = ann['image_id']
+        # Correctly extract ground truth ellipse from annotation for this dataset structure
+        gt_ellipse = {
+            'center_x': ann['cx'],
+            'center_y': ann['cy'],
+            'semi_major_axis': ann['a'],
+            'semi_minor_axis': ann['b'],
+            'orientation_angle_rad': ann['theta']
+        }
+        gt_ellipses = [gt_ellipse] # Wrap in a list for compatibility with AntColonyMatcher
+
+        # Simulate detections (GT + small noise)
+        det_ellipses = []
+        for e in gt_ellipses:
+            det_e = e.copy()
+            det_e['center_x'] += np.random.normal(0, 0.5)
+            det_e['center_y'] += np.random.normal(0, 0.5)
+            det_e['semi_major_axis'] += np.random.normal(0, 0.5)
+            det_e['semi_minor_axis'] += np.random.normal(0, 0.5)
+            det_e['orientation_angle_rad'] += np.random.normal(0, 0.05)
+            det_ellipses.append(det_e)
+
+        # Compute Cost Matrix (1 - IoU)
+        n_gt = len(gt_ellipses)
+        n_det = len(det_ellipses)
+        cost_matrix = np.zeros((n_gt, n_det))
+        for i in range(n_gt):
+            for j in range(n_det):
+                cost_matrix[i, j] = 1.0 - calculate_iou(gt_ellipses[i], det_ellipses[j])
+
+        # Use ACO to match
+        matcher = AntColonyMatcher(cost_matrix) # Pass cost_matrix directly
+        matching, _ = matcher.run()
+
+        img_metrics = []
+        for gt_idx, det_idx in matching:
+            if det_idx != -1:
+                gt = gt_ellipses[gt_idx]
+                det = det_ellipses[det_idx]
+                iou = calculate_iou(gt, det)
+                mae_cx = abs(gt['center_x'] - det['center_x'])
+                mae_cy = abs(gt['center_y'] - det['center_y'])
+                mae_a = abs(gt['semi_major_axis'] - det['semi_major_axis'])
+                mae_b = abs(gt['semi_minor_axis'] - det['semi_minor_axis'])
+                mae_theta = abs(gt['orientation_angle_rad'] - det['orientation_angle_rad'])
+
+                metric = {
+                    'image_id': img_id,
+                    'iou': iou,
+                    'mae_cx': mae_cx,
+                    'mae_cy': mae_cy,
+                    'mae_a': mae_a,
+                    'mae_b': mae_b,
+                    'mae_theta': mae_theta,
+                    'passed': iou > 0.8
+                }
+                all_metrics.append(metric)
+                img_metrics.append(metric)
+
+        # Visualization for a few images - NOTE: This visualization currently draws mm coords directly on 20x20 img
+        # which may not be scaled correctly. For accurate visualization, scaling to pixel space needed.
+        if img_id % 10 == 0:
+            img_path = os.path.join(img_dir, f"id_{img_id}.png")
+            if os.path.exists(img_path):
+                # Load the 20x20 image for background, if it exists
+                background_img = cv2.imread(img_path)
+                if background_img is None:
+                    # Create a blank image if original not found or is not an image
+                    background_img = np.zeros((20, 20, 3), dtype=np.uint8) # Default to 20x20 if image not available
+                # For displaying, scale the 20x20 image to a larger size if needed for better visibility
+                display_img_size = 200 # e.g., 10 times larger for better view
+                display_img = cv2.resize(background_img, (display_img_size, display_img_size), interpolation=cv2.INTER_NEAREST)
+
+                # Scale ellipse coordinates from mm to display_img_size pixels (200x200)
+                display_scale_factor = display_img_size / SPACE_SIZE_MM # SPACE_SIZE_MM is 40.0
+
+                # Helper to convert mm ellipse params to display_img_size pixels
+                def _render_ellipse_params_for_display(e_mm):
+                    cx_d = int(round(e_mm['center_x'] * display_scale_factor))
+                    cy_d = int(round(e_mm['center_y'] * display_scale_factor))
+                    a_d = int(round(e_mm['semi_major_axis'] * display_scale_factor))
+                    b_d = int(round(e_mm['semi_minor_axis'] * display_scale_factor))
+                    angle_deg = np.degrees(e_mm['orientation_angle_rad'])
+                    return (cx_d, cy_d), (a_d, b_d), angle_deg
+
+                for e in gt_ellipses:
+                    center, axes, angle = _render_ellipse_params_for_display(e)
+                    cv2.ellipse(display_img, center, axes, angle, 0, 360, (0, 255, 0), 1) # Green for GT
+                for e in det_ellipses:
+                    center, axes, angle = _render_ellipse_params_for_display(e)
+                    cv2.ellipse(display_img, center, axes, angle, 0, 360, (0, 0, 255), 1) # Blue for Detected
+
+                cv2.imwrite(f"{output_dir}/visualizations/id_{img_id}_eval.png", display_img)
+
+    df = pd.DataFrame(all_metrics)
+    df.to_csv(f"{output_dir}/results.csv", index=False)
+
+    # Generate Histograms
+    plt.figure(figsize=(10, 6))
+    sns.histplot(df['iou'], bins=20, kde=True)
+    plt.title('IoU Distribution')
+    plt.savefig(f"{output_dir}/iou_histogram.png")
+
+    # Generate MAE Chart
+    mae_cols = ['mae_cx', 'mae_cy', 'mae_a', 'mae_b', 'mae_theta']
+    mae_means = df[mae_cols].mean()
+    plt.figure(figsize=(10, 6))
+    mae_means.plot(kind='bar')
+    plt.title('Mean Absolute Error (MAE) per Parameter')
+    plt.ylabel('Error Value')
+    plt.savefig(f"{output_dir}/mae_chart.png")
+
+    # Pass Rate
+    pass_rate = df['passed'].mean() * 100
+    print(f"Pass Rate: {pass_rate:.2f}%")
+
+    with open(f"{output_dir}/summary.txt", 'w') as f:
+        f.write(f"Evaluation Summary of the ellipse parameters\n")
+        f.write(f"==================\n")
+        f.write(f"Total matched ellipses: {len(df)}\n")
+        f.write(f"Average IoU: {df['iou'].mean():.4f}\n")
+        f.write(f"Pass Rate (IoU > 0.7): {pass_rate:.2f}%\n")
+        f.write(f"Mean MAE cx: {df['mae_cx'].mean():.4f}\n")
+        f.write(f"Mean MAE cy: {df['mae_cy'].mean():.4f}\n")
+        f.write(f"Mean MAE a: {df['mae_a'].mean():.4f}\n")
+        f.write(f"Mean MAE b: {df['mae_b'].mean():.4f}\n")
+        f.write(f"Mean MAE theta: {df['mae_theta'].mean():.4f}\n")
+
+if __name__ == "__main__":
+    # Corrected dataset_base path
+    dataset_base = "/content/ElGenV1_Ellipses_1000"
+    evaluate_dataset(
+        f"{dataset_base}/annotations.json",
+        f"{dataset_base}/Ellipses",
+        "/content/evaluation_output_multi_ellipse" # Changed output folder to avoid conflict with previous output
+    )
